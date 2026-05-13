@@ -29,6 +29,10 @@ DEFAULT_TOOLS_BY_TYPE = {
     },
     "code": {
         "search_codebase",
+        "multi_repo_search",
+        "find_similar_code",
+        "list_indexed_files",
+        "get_file_chunks",
     },
     "orchestrator": set(),  # orchestrator agents delegate to sub-agents; no extra tools needed
     "delegate": set(),      # delegate agents route to sub-agents via synthetic delegate_to_agent tool
@@ -90,10 +94,12 @@ async def aggregate_all_tools(agent_sessions, active_agent, custom_tools_list):
                 if tool_name not in allowed_tools:
                     allowed_tools.append(tool_name)
 
-    # Remove search_codebase if embed_code is disabled
+    # Remove embedding tools if embed_code is disabled
     settings = load_settings()
     if not settings.get("embed_code", False):
-        allowed_tools = [t for t in allowed_tools if t != "search_codebase"]
+        _embed_tools = {"search_codebase", "multi_repo_search", "find_similar_code",
+                        "list_indexed_files", "get_file_chunks"}
+        allowed_tools = [t for t in allowed_tools if t not in _embed_tools]
 
     # Standard MCP Tools
     for session_name, session in agent_sessions.items():
@@ -207,6 +213,18 @@ def build_system_prompt(agent_system_template, tools_json, session_id, session_s
     """
     # Determine if code embedding is enabled (for conditional tool description)
     _embed_code = load_settings().get("embed_code", False)
+    _embed_tools_desc = (
+        "- **`search_codebase`** - semantic search within specific repos. Requires `repo_ids`."
+        " Add `file_filter` (e.g. `.py`, `components`) to narrow results.\n"
+        "- **`multi_repo_search`** - like search_codebase but `repo_ids` is optional;"
+        " omit to search ALL indexed repos at once.\n"
+        "- **`find_similar_code`** - pass a code snippet to find similar patterns across repos"
+        " (vs. natural language in search_codebase).\n"
+        "- **`list_indexed_files`** - list every file in the embedding index with chunk counts."
+        " Use before searching to understand coverage.\n"
+        "- **`get_file_chunks`** - retrieve all indexed chunks for a specific file"
+        " (the semantic outline). Use after finding a relevant file."
+    ) if _embed_code else ""
 
     # Get current date/time for context injection
     now = datetime.datetime.now(zoneinfo.ZoneInfo("UTC"))
@@ -279,7 +297,7 @@ You have access to the following tools:
 {tools_json}
 
 **CODE & FILE NAVIGATION:**
-{"- **`search_codebase`** — semantic search across indexed repos. Requires `repo_ids`. Best for broad symbol or concept search." if _embed_code else ""}
+{_embed_tools_desc}
 - **`grep`** — search for a pattern inside a file or across all files in a folder. Pass a file path to search that file, or a folder path to search all files within it. Use `file_pattern` to filter by extension (e.g. `*.py`, `*.ts`).
 - **`glob`** — discover file paths by pattern (e.g. `**/*.py`, `src/**/*.ts`).
 - **`read_file`** — read an entire file. Use when you already know the path and the file is small. For large files, prefer `read_file_by_lines` or `grep`.

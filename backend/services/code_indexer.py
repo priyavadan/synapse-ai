@@ -356,6 +356,31 @@ def get_index_status(repo_id: str) -> dict:
         return {"status": "error", "message": str(e), "count": 0}
 
 
+def _get_current_vector_dim(repo_id: str) -> int | None:
+    """Return the vector column dimension currently in the DB, or None if absent."""
+    if not COCOINDEX_AVAILABLE:
+        return None
+    table_name = get_table_name(repo_id)
+    db_url = _get_db_url()
+    if not db_url:
+        return None
+    try:
+        with psycopg.connect(db_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT atttypmod
+                    FROM pg_attribute
+                    JOIN pg_class ON pg_class.oid = pg_attribute.attrelid
+                    WHERE pg_class.relname = %s
+                      AND pg_attribute.attname = 'embedding'
+                      AND atttypmod > 0
+                """, (table_name,))
+                row = cur.fetchone()
+                return row[0] if row else None
+    except Exception:
+        return None
+
+
 def drop_index(repo_id: str):
     """Drop all tables and CocoIndex metadata for a repo — ensures clean rebuild."""
     if not COCOINDEX_AVAILABLE:
@@ -399,7 +424,7 @@ def _update_repo_status(repo_id: str, **fields):
             json.dump(repos, f, indent=4)
 
 
-def run_index_task(repo_id: str, repo_path: str, included_patterns: list[str], excluded_patterns: list[str]):
+def run_index_task(repo_id: str, repo_path: str, included_patterns: list[str], excluded_patterns: list[str], full_reindex: bool = True):
     if not COCOINDEX_AVAILABLE:
         msg = (
             "CocoIndex not installed in the backend venv — indexing skipped.\n"
@@ -416,11 +441,31 @@ def run_index_task(repo_id: str, repo_path: str, included_patterns: list[str], e
     stop = _stop_events.setdefault(repo_id, threading.Event())
     stop.clear()  # reset from any previous stop request
 
-    print(f"Starting index builder for {repo_id}...")
+    print(f"Starting index builder for {repo_id} (full_reindex={full_reindex})...")
     _update_repo_status(repo_id, status="indexing", error_message=None)
     try:
-        print("[index] Step 0: drop stale tables + CocoIndex metadata")
-        drop_index(repo_id)
+        if full_reindex:
+            print("[index] Step 0: drop stale tables + CocoIndex metadata")
+            drop_index(repo_id)
+        else:
+            # Schema guard: if the embedding dim stored in the DB differs from the currently
+            # configured model's dim, a full rebuild is unavoidable (vector columns are fixed-width).
+            try:
+                model = get_configured_embedding_model()
+                settings = load_settings()
+                dim = probe_embedding_dim(model, settings)
+                current_dim = _get_current_vector_dim(repo_id)
+                if current_dim is not None and current_dim != dim:
+                    print(f"[index] Embedding dim changed ({current_dim} → {dim}), promoting to full reindex")
+                    drop_index(repo_id)
+                    full_reindex = True
+                else:
+                    print("[index] Incremental reindex — tracking table preserved, only changed files will be processed")
+            except Exception as e:
+                print(f"[index] Schema check failed ({e}), falling back to full reindex")
+                drop_index(repo_id)
+                full_reindex = True
+
         if stop.is_set():
             print(f"[index] Stop requested after step 0 — aborting {repo_id}")
             _update_repo_status(repo_id, status="stopped", error_message=None)
@@ -451,7 +496,10 @@ def run_index_task(repo_id: str, repo_path: str, included_patterns: list[str], e
         # update() is a long-running Rust call — we can't interrupt it mid-way,
         # but we check the stop flag immediately after it returns.
         print("[index] Step 4: repo_flow.update()")
-        repo_flow.update(full_reprocess=True)
+        if full_reindex:
+            repo_flow.update(full_reprocess=True)
+        else:
+            repo_flow.update()  # incremental — CocoIndex processes only changed/new files
 
         if stop.is_set():
             print(f"[index] Stop requested — marking {repo_id} as stopped")
@@ -493,10 +541,10 @@ def stop_index(repo_id: str) -> bool:
     return False
 
 
-def run_index(repo_id: str, repo_path: str, included_patterns: list[str], excluded_patterns: list[str]):
+def run_index(repo_id: str, repo_path: str, included_patterns: list[str], excluded_patterns: list[str], full_reindex: bool = True):
     t = threading.Thread(
         target=run_index_task,
-        args=(repo_id, repo_path, included_patterns, excluded_patterns),
+        args=(repo_id, repo_path, included_patterns, excluded_patterns, full_reindex),
         daemon=True,
     )
     _active_threads[repo_id] = t

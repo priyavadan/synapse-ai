@@ -521,7 +521,7 @@ export const SettingsView = ({ initialTab = 'general', initialSubTab }: { initia
                             groups[source] = {
                                 id: source,
                                 label: t.source_label || source.charAt(0).toUpperCase() + source.slice(1).replace(/_/g, ' '),
-                                description: `Tools from ${source}`,
+                                description: `Tools from ${t.source_label || source}`,
                                 tools: [],
                                 toolDetails: [],
                                 /*

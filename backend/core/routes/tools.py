@@ -35,6 +35,21 @@ async def get_custom_tools():
     return load_custom_tools()
 
 
+_NATIVE_SERVER_LABELS: dict[str, str] = {
+    "code_vault_search": "Code Search",
+    "time": "Time & Date",
+    "sql": "SQL Database",
+    "personal_details": "Personal Details",
+    "collect_data": "Collect Data",
+    "pdf_parser": "PDF Parser",
+    "xlsx_parser": "Excel / XLSX",
+    "vault_sandbox": "Vault Sandbox",
+    "web_scraper": "Web Scraper",
+    "bash": "Bash",
+    "Filesystem": "Filesystem",
+}
+
+
 @router.get("/api/tools/available")
 async def get_available_tools():
     """List all available tools from all sources (Native Agents, External MCP, Custom HTTP)"""
@@ -54,7 +69,7 @@ async def get_available_tools():
                 cfg = _server.mcp_manager.get_server_config(server_name)
                 display_label = (cfg.get("label") or server_name) if cfg else server_name
             else:
-                display_label = server_name
+                display_label = _NATIVE_SERVER_LABELS.get(server_name, server_name)
 
             result = await session.list_tools()
             for t in result.tools:

@@ -3,10 +3,15 @@ Repo management endpoints (CRUD + reindex).
 """
 import os
 import json
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Body
+from pydantic import BaseModel
 from core.models import Repo
 from core.config import DATA_DIR, load_settings
 from core.json_store import JsonStore
+
+
+class ReindexOptions(BaseModel):
+    full_reindex: bool = False
 
 router = APIRouter()
 
@@ -147,7 +152,8 @@ async def delete_repo(repo_id: str):
     return {"status": "success"}
 
 @router.post("/api/repos/{repo_id}/reindex")
-async def reindex_repo(repo_id: str, background_tasks: BackgroundTasks):
+async def reindex_repo(repo_id: str, background_tasks: BackgroundTasks,
+                       opts: ReindexOptions = Body(default=ReindexOptions())):
     repos = load_repos()
     repo = next((r for r in repos if r["id"] == repo_id), None)
     if not repo:
@@ -174,14 +180,16 @@ async def reindex_repo(repo_id: str, background_tasks: BackgroundTasks):
     # Run in background
     try:
         from services.code_indexer import run_index
-        background_tasks.add_task(run_index, repo_id, real_path, repo["included_patterns"], repo["excluded_patterns"])
+        background_tasks.add_task(run_index, repo_id, real_path,
+                                  repo["included_patterns"], repo["excluded_patterns"],
+                                  opts.full_reindex)
     except ImportError as e:
         print("Indexer unavailable:", e)
         repo["status"] = "error"
         save_repos(repos)
         raise HTTPException(status_code=500, detail="Indexer service not available")
 
-    return {"status": "indexing_started"}
+    return {"status": "indexing_started", "full_reindex": opts.full_reindex}
 
 
 @router.post("/api/repos/{repo_id}/stop-index")

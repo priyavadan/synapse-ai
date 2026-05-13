@@ -59,7 +59,7 @@ class Repo(BaseModel):
     name: str
     path: str
     description: str = ""
-    included_patterns: list[str] = ["*.py", "*.ts", "*.tsx", "*.js", "*.jsx", "*.rs", "*.go", "*.java", "*.md", "*.html", "*.vue", "*.css", "*.scss", "*.cpp", "*.c"]
+    included_patterns: list[str] = ["*.py", "*.ts", "*.tsx", "*.js", "*.jsx", "*.rs", "*.go", "*.java", "*.md", "*.html", "*.vue", "*.svelte", "*.css", "*.scss", "*.cpp", "*.c"]
     excluded_patterns: list[str] = [".*", "node_modules", "__pycache__", "venv", ".git", "*.pyc"]
     last_indexed: str | None = None
     status: str = "pending" # pending | indexing | indexed | error

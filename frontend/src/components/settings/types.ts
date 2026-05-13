@@ -13,7 +13,7 @@ export type Tab = 'general' | 'models' | 'workspace' | 'memory' | 'agents' | 'or
 // Shown as 'DEFAULT' in the UI and not editable.
 export const AUTO_TOOLS_BY_TYPE: Record<string, string[]> = {
     all_types: ['sequentialthinking', 'read_file', 'read_multiple_files', 'search_files', 'list_directory', 'get_file_info', 'grep', 'glob', 'read_file_by_lines'],
-    code: ['search_codebase'],
+    code: ['search_codebase', 'multi_repo_search', 'find_similar_code', 'list_indexed_files', 'get_file_chunks'],
     orchestrator: [],
     delegate: [],
 };

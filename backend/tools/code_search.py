@@ -108,7 +108,20 @@ def _get_table_name(repo_id: str) -> str:
     return f"ci_{repo_id}__emb"
 
 
-async def _search(query: str, repo_ids: list[str], top_k: int = 10) -> list[dict]:
+def _load_indexed_repo_ids() -> list[str]:
+    """Return repo IDs where status == 'indexed' from repos.json."""
+    try:
+        from core.config import DATA_DIR
+        repos_file = os.path.join(DATA_DIR, "repos.json")
+        with open(repos_file) as f:
+            repos = json.load(f)
+        return [r["id"] for r in repos if r.get("status") == "indexed" and r.get("id")]
+    except Exception:
+        return []
+
+
+async def _search(query: str, repo_ids: list[str], top_k: int = 10,
+                  file_filter: str | None = None, min_score: float = 0.0) -> list[dict]:
     """Search indexed repos using cosine similarity."""
     try:
         pool = _get_pool()
@@ -143,13 +156,17 @@ async def _search(query: str, repo_ids: list[str], top_k: int = 10) -> list[dict
 
                     repo_root = repo_path_map.get(repo_id, "")
                     for row in cur.fetchall():
-                        # location may be a psycopg Range object — convert to string
                         loc = row[2]
                         if hasattr(loc, 'lower') and hasattr(loc, 'upper'):
                             loc = f"{loc.lower}-{loc.upper}"
                         else:
                             loc = str(loc) if loc is not None else ""
                         filename = row[0].lstrip("/")
+                        score = round(1.0 - row[3], 5)
+                        if score < min_score:
+                            continue
+                        if file_filter and file_filter not in filename:
+                            continue
                         full_path = f"{repo_root}/{filename}" if repo_root else filename
                         all_results.append({
                             "repo_id": repo_id,
@@ -157,7 +174,7 @@ async def _search(query: str, repo_ids: list[str], top_k: int = 10) -> list[dict
                             "full_path": full_path,
                             "code": row[1],
                             "location": loc,
-                            "score": round(1.0 - row[3], 5)
+                            "score": score,
                         })
                 except Exception as e:
                     err_text = str(e)
@@ -173,6 +190,98 @@ async def _search(query: str, repo_ids: list[str], top_k: int = 10) -> list[dict
     if not all_results and errors:
         return [{"error": "; ".join(errors)}]
     return all_results[:top_k]
+
+
+def _list_files_in_index(repo_id: str, file_filter: str | None = None) -> dict:
+    """Query the embedding table for distinct filenames and chunk counts."""
+    if not _VALID_REPO_ID.match(repo_id):
+        return {"error": f"Invalid repo_id format: {repo_id}"}
+    try:
+        pool = _get_pool()
+    except Exception as e:
+        return {"error": f"Database connection failed: {e}"}
+
+    repo_path_map = _load_repo_paths()
+    repo_root = repo_path_map.get(repo_id, "")
+    table_name = _get_table_name(repo_id)
+
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                if file_filter:
+                    cur.execute(f"""
+                        SELECT filename, COUNT(*) AS chunk_count
+                        FROM "{table_name}"
+                        WHERE filename LIKE %s
+                        GROUP BY filename
+                        ORDER BY filename
+                    """, (f"%{file_filter}%",))
+                else:
+                    cur.execute(f"""
+                        SELECT filename, COUNT(*) AS chunk_count
+                        FROM "{table_name}"
+                        GROUP BY filename
+                        ORDER BY filename
+                    """)
+                rows = cur.fetchall()
+    except Exception as e:
+        return {"error": f"Query failed for repo '{repo_id}': {e}"}
+
+    files = []
+    total_chunks = 0
+    for row in rows:
+        filename = row[0].lstrip("/")
+        chunk_count = row[1]
+        total_chunks += chunk_count
+        full_path = f"{repo_root}/{filename}" if repo_root else filename
+        files.append({"filename": filename, "chunk_count": chunk_count, "full_path": full_path})
+
+    return {"repo_id": repo_id, "files": files, "total_files": len(files), "total_chunks": total_chunks}
+
+
+def _get_chunks_for_file(repo_id: str, filename: str) -> dict:
+    """Retrieve all indexed chunks for a specific file."""
+    if not _VALID_REPO_ID.match(repo_id):
+        return {"error": f"Invalid repo_id format: {repo_id}"}
+    try:
+        pool = _get_pool()
+    except Exception as e:
+        return {"error": f"Database connection failed: {e}"}
+
+    repo_path_map = _load_repo_paths()
+    repo_root = repo_path_map.get(repo_id, "")
+    table_name = _get_table_name(repo_id)
+    clean_filename = filename.lstrip("/")
+
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                # Try both with and without leading slash to be robust
+                cur.execute(f"""
+                    SELECT location, code
+                    FROM "{table_name}"
+                    WHERE filename = %s OR filename = %s
+                    ORDER BY location
+                """, (clean_filename, "/" + clean_filename))
+                rows = cur.fetchall()
+    except Exception as e:
+        return {"error": f"Query failed for '{filename}' in repo '{repo_id}': {e}"}
+
+    if not rows:
+        return {"error": f"No chunks found for '{filename}' in repo '{repo_id}'. Use list_indexed_files to see available files."}
+
+    chunks = []
+    for row in rows:
+        loc = row[0]
+        if hasattr(loc, 'lower') and hasattr(loc, 'upper'):
+            loc = f"{loc.lower}-{loc.upper}"
+        else:
+            loc = str(loc) if loc is not None else ""
+        chunks.append({"location": loc, "code": row[1]})
+
+    full_path = f"{repo_root}/{clean_filename}" if repo_root else clean_filename
+    return {"repo_id": repo_id, "filename": clean_filename, "full_path": full_path,
+            "chunks": chunks, "total_chunks": len(chunks)}
 
 
 def _grep_file(
@@ -397,7 +506,9 @@ async def list_tools() -> list[types.Tool]:
             description=(
                 "Search indexed code repositories for relevant code snippets using semantic vector search. "
                 "Returns matching code with filename, location, and relevance score. "
-                "You MUST provide repo_ids — check the LINKED CODE REPOSITORIES section in your system prompt for available repo IDs."
+                "You MUST provide repo_ids — check the LINKED CODE REPOSITORIES section in your system prompt for available repo IDs. "
+                "Use file_filter to narrow results to a specific path or file type (e.g. 'components', '.py'). "
+                "Use min_score (0–1) to discard low-confidence matches."
             ),
             inputSchema={
                 "type": "object",
@@ -415,9 +526,138 @@ async def list_tools() -> list[types.Tool]:
                         "type": "integer",
                         "description": "Number of results to return (default 10)",
                         "default": 10
+                    },
+                    "file_filter": {
+                        "type": "string",
+                        "description": "Only return results from files whose path contains this string (e.g. 'src/api', '.py', 'components')"
+                    },
+                    "min_score": {
+                        "type": "number",
+                        "description": "Minimum relevance score 0–1 (default 0.0 — return all). Higher values (e.g. 0.7) return only strong matches.",
+                        "default": 0.0
                     }
                 },
                 "required": ["query", "repo_ids"]
+            },
+        ),
+        types.Tool(
+            name="multi_repo_search",
+            description=(
+                "Search across multiple indexed repos simultaneously and return globally ranked results. "
+                "Unlike search_codebase, repo_ids is optional — if omitted, ALL indexed repos are searched automatically. "
+                "Use this when you don't know which repo contains the code you're looking for, or want the best match anywhere. "
+                "Use file_filter to narrow to a specific path or file type."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language or code search query"
+                    },
+                    "repo_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Repos to search. Omit or pass an empty list to search ALL indexed repos."
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Total results to return across all repos (default 10)",
+                        "default": 10
+                    },
+                    "file_filter": {
+                        "type": "string",
+                        "description": "Only return results from files whose path contains this string"
+                    },
+                    "min_score": {
+                        "type": "number",
+                        "description": "Minimum relevance score 0–1 (default 0.0)",
+                        "default": 0.0
+                    }
+                },
+                "required": ["query"]
+            },
+        ),
+        types.Tool(
+            name="find_similar_code",
+            description=(
+                "Given a code snippet, find semantically similar code patterns across one or more repos. "
+                "Unlike search_codebase (which takes natural language), this embeds actual code — "
+                "use it when you have a piece of code and want to find similar implementations or usages elsewhere. "
+                "repo_ids is optional; omit to search all indexed repos."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "A code snippet to find similar patterns for"
+                    },
+                    "repo_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Repos to search. Omit to search all indexed repos."
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Number of results to return (default 10)",
+                        "default": 10
+                    },
+                    "file_filter": {
+                        "type": "string",
+                        "description": "Only return results from files whose path contains this string"
+                    },
+                    "min_score": {
+                        "type": "number",
+                        "description": "Minimum relevance score 0–1 (default 0.0)",
+                        "default": 0.0
+                    }
+                },
+                "required": ["code"]
+            },
+        ),
+        types.Tool(
+            name="list_indexed_files",
+            description=(
+                "List all files that have been embedded in the vector index for a repo, with their chunk counts. "
+                "Use this to discover what's covered by the index before searching, or to verify a specific file was indexed. "
+                "Optionally filter by file path substring."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_id": {
+                        "type": "string",
+                        "description": "The repo ID to list indexed files for"
+                    },
+                    "file_filter": {
+                        "type": "string",
+                        "description": "Only show files whose path contains this string (e.g. 'src/', '.py')"
+                    }
+                },
+                "required": ["repo_id"]
+            },
+        ),
+        types.Tool(
+            name="get_file_chunks",
+            description=(
+                "Get all embedded chunks for a specific file — the semantic view of that file as seen by the index. "
+                "After finding a relevant file via search_codebase, use this to retrieve all its indexed segments "
+                "and understand the full scope of what's embedded, without reading the raw file."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "repo_id": {
+                        "type": "string",
+                        "description": "The repo ID the file belongs to"
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Relative file path as returned by search_codebase (e.g. 'src/auth/login.py')"
+                    }
+                },
+                "required": ["repo_id", "filename"]
             },
         ),
         types.Tool(
@@ -496,12 +736,66 @@ async def call_tool(
             query = arguments.get("query", "")
             repo_ids = arguments.get("repo_ids", [])
             top_k = arguments.get("top_k", 10)
+            file_filter = arguments.get("file_filter") or None
+            min_score = float(arguments.get("min_score", 0.0))
 
             if not query or not repo_ids:
                 return [types.TextContent(type="text", text=json.dumps({"error": "Both 'query' and 'repo_ids' are required."}))]
 
-            results = await _search(query, repo_ids, top_k)
+            results = await _search(query, repo_ids, top_k, file_filter=file_filter, min_score=min_score)
             return [types.TextContent(type="text", text=json.dumps({"results": results}, ensure_ascii=False))]
+
+        if name == "multi_repo_search":
+            query = arguments.get("query", "")
+            if not query:
+                return [types.TextContent(type="text", text=json.dumps({"error": "'query' is required."}))]
+
+            repo_ids = arguments.get("repo_ids") or []
+            if not repo_ids:
+                repo_ids = _load_indexed_repo_ids()
+                if not repo_ids:
+                    return [types.TextContent(type="text", text=json.dumps({"error": "No indexed repos found. Index a repo first."}))]
+
+            top_k = arguments.get("top_k", 10)
+            file_filter = arguments.get("file_filter") or None
+            min_score = float(arguments.get("min_score", 0.0))
+
+            results = await _search(query, repo_ids, top_k, file_filter=file_filter, min_score=min_score)
+            return [types.TextContent(type="text", text=json.dumps({"results": results, "repos_searched": repo_ids}, ensure_ascii=False))]
+
+        if name == "find_similar_code":
+            code = arguments.get("code", "")
+            if not code:
+                return [types.TextContent(type="text", text=json.dumps({"error": "'code' is required."}))]
+
+            repo_ids = arguments.get("repo_ids") or []
+            if not repo_ids:
+                repo_ids = _load_indexed_repo_ids()
+                if not repo_ids:
+                    return [types.TextContent(type="text", text=json.dumps({"error": "No indexed repos found. Index a repo first."}))]
+
+            top_k = arguments.get("top_k", 10)
+            file_filter = arguments.get("file_filter") or None
+            min_score = float(arguments.get("min_score", 0.0))
+
+            results = await _search(code, repo_ids, top_k, file_filter=file_filter, min_score=min_score)
+            return [types.TextContent(type="text", text=json.dumps({"results": results, "repos_searched": repo_ids}, ensure_ascii=False))]
+
+        if name == "list_indexed_files":
+            repo_id = arguments.get("repo_id", "")
+            if not repo_id:
+                return [types.TextContent(type="text", text=json.dumps({"error": "'repo_id' is required."}))]
+            file_filter = arguments.get("file_filter") or None
+            result = _list_files_in_index(repo_id, file_filter=file_filter)
+            return [types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
+
+        if name == "get_file_chunks":
+            repo_id = arguments.get("repo_id", "")
+            filename = arguments.get("filename", "")
+            if not repo_id or not filename:
+                return [types.TextContent(type="text", text=json.dumps({"error": "Both 'repo_id' and 'filename' are required."}))]
+            result = _get_chunks_for_file(repo_id, filename)
+            return [types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
 
         if name == "grep":
             # Accept both new `path` and legacy `file_path` for backward compatibility
