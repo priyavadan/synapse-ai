@@ -160,6 +160,14 @@ class OrchestrationEngine:
                 # reaches a waiter in a different Task's context).
                 # This properly interrupts a stuck session.call_tool() inside
                 # the executor when the step deadline is reached.
+                #
+                # IMPORTANT: never yield human_input_required inside the
+                # fail_after scope. Python's GC finalizer runs aclose() on
+                # abandoned async generators in a NEW asyncio Task; if a
+                # cancel scope is active at the suspension point, anyio raises
+                # "cancel scope in a different task". We break out of the scope
+                # cleanly (in the current task) and yield the event below.
+                human_input_event: dict | None = None
                 try:
                     with anyio.fail_after(step_timeout):
                         async for event in executor.execute(step, run, self):
@@ -187,8 +195,13 @@ class OrchestrationEngine:
                                 if logger:
                                     logger.step_end(step.id, "paused")
                                     logger.run_end("paused")
-                                yield event
-                                return
+                                # Break exits the async-for and then the
+                                # fail_after scope cleanly in this task.
+                                # The event is yielded below, outside the scope,
+                                # so the generator suspends with no cancel scope
+                                # active — safe for cross-task GC finalization.
+                                human_input_event = event
+                                break
 
                             if event.get("type") == "orchestration_end":
                                 yield event
@@ -211,6 +224,14 @@ class OrchestrationEngine:
                     run.status = "failed"
                     if logger:
                         logger.step_end(step.id, "failed", f"Timed out after {step_timeout}s")
+
+                # Yield human_input_required OUTSIDE the anyio cancel scope.
+                # The generator suspends here with no active cancel scope, so
+                # Python's GC-triggered aclose() (which runs in a new asyncio
+                # Task) won't hit "cancel scope in a different task".
+                if human_input_event is not None:
+                    yield human_input_event
+                    return
 
                 # If END step or timeout set status, break out
                 if run.status in ("completed", "failed"):
